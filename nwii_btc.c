@@ -32,6 +32,9 @@ static btstack_timer_source_t reconnect_timer;
 
 static bool hid_device_pair_enabled = false;
 
+/* The Wii's SYNC search only answers devices listening on the Limited Inquiry Access Code. */
+static bool _btc_iac_pending = true;
+
 /* Scratch buffers for SDP records published to the host. */
 static uint8_t hid_service_buffer[NWII_HID_SDP_RECORD_LEN] = {0};
 static uint8_t pnp_service_buffer[100] = {0};
@@ -120,6 +123,17 @@ static void _nwii_btc_setreport_handler(uint16_t cid, hid_report_type_t report_t
     nwii_api_output_tunnel(report, (uint16_t)report_size);
 }
 
+/* Listen on both the limited (Wii SYNC) and general inquiry access codes. Sent as soon as the
+ * controller can take a command, since BTstack has no GAP call for two IACs. */
+static void _nwii_btc_write_iac_task(void)
+{
+    if (!_btc_iac_pending || !hci_can_send_command_packet_now()) return;
+
+    _btc_iac_pending = false;
+    hci_send_cmd(&hci_write_current_iac_lap_two_iacs, 2, NWII_HID_INQUIRY_ACCESS_CODE, GAP_IAC_GENERAL_INQUIRY);
+    printf("Inquiry access codes: limited + general\n");
+}
+
 static void _nwii_btc_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t packet_size)
 {
     UNUSED(channel);
@@ -135,6 +149,7 @@ static void _nwii_btc_packet_handler(uint8_t packet_type, uint16_t channel, uint
         if (btstack_event_state_get_state(packet) != HCI_STATE_WORKING) return;
 
         printf("BTstack up, local address %s\n", bd_addr_to_str(device_mac));
+        _nwii_btc_write_iac_task();
 
         // Discoverable either way so the Wii can SYNC (or temporarily connect) at any time
         gap_discoverable_control(1);
@@ -147,6 +162,11 @@ static void _nwii_btc_packet_handler(uint8_t packet_type, uint16_t channel, uint
         {
             printf("Discoverable: press SYNC on the Wii\n");
         }
+        break;
+
+    case HCI_EVENT_COMMAND_COMPLETE:
+    case HCI_EVENT_COMMAND_STATUS:
+        if (hci_get_state() == HCI_STATE_WORKING) _nwii_btc_write_iac_task();
         break;
 
     case HCI_EVENT_CONNECTION_REQUEST:
