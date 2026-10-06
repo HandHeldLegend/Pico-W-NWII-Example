@@ -257,6 +257,15 @@ static void _nwii_btc_packet_handler(uint8_t packet_type, uint16_t channel, uint
         case HID_SUBEVENT_CONNECTION_CLOSED:
             printf("HID disconnected\n");
             hid_cid = 0;
+
+            /* Starting a title reloads the Wii's system software and drops every link; a real
+             * remote reconnects on its own, so page the Wii again. */
+            if (_nwii_btc_host_saved())
+            {
+                btstack_run_loop_set_timer_handler(&reconnect_timer, &_reconnect_timer_handler);
+                btstack_run_loop_set_timer(&reconnect_timer, _btc_reconnect_ms);
+                btstack_run_loop_add_timer(&reconnect_timer);
+            }
             break;
 
         case HID_SUBEVENT_CAN_SEND_NOW:
