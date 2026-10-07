@@ -44,6 +44,13 @@ static bool _btc_offline = false; /* Console "disconnect": radio stays off until
 static bool _btc_hid_open = false; /* hid_cid is assigned before the connection finishes opening */
 static hci_con_handle_t wii_acl_handle = HCI_CON_HANDLE_INVALID;
 
+/* Powering off, the Wii only closes the HID channels (as when quitting a title), so reconnecting
+ * starts as usual. A Wii in standby still accepts a new link but never answers the HID channel
+ * request (L2CAP RTX timeout), while a reloading Wii refuses it outright until it is ready. On the
+ * standby answer, stop like a real remote does instead of paging again. */
+static bool _btc_reconnecting = false; /* Paging again after the Wii closed an open connection */
+static bool _btc_fresh_acl = false;    /* This attempt brought up a new link */
+
 /* Page timeout while reconnecting (x 0.625 ms, ~5 s) so retries during a reload stay short */
 #define NWII_BTC_PAGE_TIMEOUT 0x2000
 static btstack_timer_source_t reconnect_timer;
@@ -77,6 +84,7 @@ static bool _nwii_btc_host_saved(void)
 
 static void _nwii_btc_connect_saved_host(void)
 {
+    _btc_fresh_acl = false;
     printf("Paging saved Wii %s\n", bd_addr_to_str(device_storage.host_mac));
     uint8_t status = hid_device_connect(device_storage.host_mac, &hid_cid);
     if (status) printf("hid_device_connect error 0x%02X\n", status);
@@ -320,7 +328,10 @@ static void _nwii_btc_packet_handler(uint8_t packet_type, uint16_t channel, uint
         printf("ACL connection complete: %s status 0x%02X\n", bd_addr_to_str(addr),
                hci_event_connection_complete_get_status(packet));
         if (hci_event_connection_complete_get_status(packet) == ERROR_CODE_SUCCESS)
+        {
             wii_acl_handle = hci_event_connection_complete_get_connection_handle(packet);
+            _btc_fresh_acl = true;
+        }
         break;
 
     case HCI_EVENT_ROLE_CHANGE:
@@ -386,6 +397,17 @@ static void _nwii_btc_packet_handler(uint8_t packet_type, uint16_t channel, uint
                 printf("HID connection to %s failed, status 0x%02X\n", bd_addr_to_str(addr), status);
                 hid_cid = 0;
 
+                /* The Wii took a new link but never answered: it has gone to standby */
+                if (_btc_reconnecting && _btc_fresh_acl && (status == L2CAP_CONNECTION_RESPONSE_RESULT_RTX_TIMEOUT))
+                {
+                    printf("Wii is in standby; staying off (send \"connect\" to try again)\n");
+                    _btc_reconnecting = false;
+                    _btc_offline = true; /* Not saved: the next boot connects as usual */
+                    btstack_run_loop_remove_timer(&reconnect_timer);
+                    hci_power_control(HCI_POWER_OFF);
+                    return;
+                }
+
                 if (!hid_device_pair_enabled && _nwii_btc_host_saved())
                 {
                     btstack_run_loop_set_timer_handler(&reconnect_timer, &_reconnect_timer_handler);
@@ -397,6 +419,7 @@ static void _nwii_btc_packet_handler(uint8_t packet_type, uint16_t channel, uint
 
             hid_cid = hid_subevent_connection_opened_get_hid_cid(packet);
             printf("HID connected to %s\n", bd_addr_to_str(addr));
+            _btc_reconnecting = false;
 
             /* Paired (or reconnected): from now on a dropped link pages this Wii again */
             hid_device_pair_enabled = false;
@@ -437,6 +460,7 @@ static void _nwii_btc_packet_handler(uint8_t packet_type, uint16_t channel, uint
 
             /* Starting or quitting a title reloads the Wii's system software; a real remote
              * reconnects on its own, so page the Wii again. */
+            _btc_reconnecting = true;
             if (_nwii_btc_host_saved())
             {
                 btstack_run_loop_set_timer_handler(&reconnect_timer, &_reconnect_timer_handler);
