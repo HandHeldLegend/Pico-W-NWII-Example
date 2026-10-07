@@ -41,6 +41,7 @@ pico_sdk_init()
 add_executable(Pico-W-NWII-Example
     main.c
     nwii_btc.c
+    nwii_console.c
     nwii_flash.c
 )
 

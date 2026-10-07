@@ -11,6 +11,7 @@
 #include "main.h"
 
 #include "pico/stdlib.h"
+#include "hardware/sync.h"
 #include "pico/cyw43_arch.h"
 #include "pico/btstack_chipset_cyw43.h"
 #include "btstack.h"
@@ -39,6 +40,7 @@ static const uint32_t _btc_reconnect_ms = 1000;
 static const uint32_t _btc_stall_ms = 6000;
 static btstack_timer_source_t stall_watchdog_timer;
 static uint32_t _btc_last_can_send_ms = 0;
+static bool _btc_offline = false; /* Console "disconnect": radio stays off until "connect" */
 static bool _btc_hid_open = false; /* hid_cid is assigned before the connection finishes opening */
 static hci_con_handle_t wii_acl_handle = HCI_CON_HANDLE_INVALID;
 
@@ -83,7 +85,7 @@ static void _nwii_btc_connect_saved_host(void)
 static void _reconnect_timer_handler(btstack_timer_source_t *ts)
 {
     (void)ts;
-    if (!hid_cid) _nwii_btc_connect_saved_host();
+    if (!hid_cid && !_btc_offline) _nwii_btc_connect_saved_host();
 }
 
 /* Re-arm packet transmission after a short delay when the poll interval has not elapsed yet. */
@@ -276,6 +278,14 @@ static void _nwii_btc_packet_handler(uint8_t packet_type, uint16_t channel, uint
             hci_set_bd_addr((uint8_t *)device_mac);
             return;
         }
+        if (btstack_event_state_get_state(packet) == HCI_STATE_OFF && _btc_offline)
+        {
+            wii_acl_handle = HCI_CON_HANDLE_INVALID;
+            hid_cid = 0;
+            _btc_iac_pending = true;
+            printf("Radio off: offline until \"connect\"\n");
+            return;
+        }
         if (btstack_event_state_get_state(packet) != HCI_STATE_WORKING) return;
 
         _btc_radio_cycling = false;
@@ -409,8 +419,9 @@ static void _nwii_btc_packet_handler(uint8_t packet_type, uint16_t channel, uint
             hid_cid = 0;
             _btc_hid_open = false;
 
-            /* Torn down by our own radio cycle: the reconnect happens once BTstack is back up */
-            if (_btc_radio_cycling) break;
+            /* Torn down by our own radio cycle (the reconnect happens once BTstack is back up), or
+             * by a console "disconnect" */
+            if (_btc_radio_cycling || _btc_offline) break;
 
             /* Quitting a title closes the HID channels but keeps the ACL link, and the Wii's
              * restarted stack will not answer on it; drop it so the reconnect pages fresh. */
@@ -498,6 +509,113 @@ static void _nwii_btc_forget_wii(void *context)
     gap_discoverable_control(1);
 }
 
+static void _nwii_btc_save_offline(bool offline)
+{
+    const uint8_t value = offline ? NWII_STORAGE_OFFLINE : 0x00;
+    if (device_storage.offline == value) return;
+    device_storage.offline = value;
+    nwii_flash_write((uint8_t *)&device_storage, NWII_STORAGE_SIZE, NWII_STORAGE_PAGE);
+}
+
+static void _nwii_btc_status(void)
+{
+    static const char *state_names[] = {"off", "initializing", "working", "halting", "sleeping", "falling asleep"};
+    const HCI_STATE state = hci_get_state();
+
+    printf("Radio: %s%s, ACL: %s, HID: %s, saved Wii: %s%s\n",
+           (state < sizeof(state_names) / sizeof(state_names[0])) ? state_names[state] : "?",
+           _btc_offline ? " (offline)" : "",
+           (wii_acl_handle != HCI_CON_HANDLE_INVALID) ? "up" : "down",
+           _btc_hid_open ? "open" : "closed",
+           _nwii_btc_host_saved() ? bd_addr_to_str(device_storage.host_mac) : "none",
+           hid_device_pair_enabled ? ", waiting for SYNC" : "");
+}
+
+static volatile uint32_t _btc_requests = 0;
+
+/* Runs on the BTstack thread */
+static void _nwii_btc_run_requests(void *context)
+{
+    (void)context;
+
+    const uint32_t save = save_and_disable_interrupts();
+    const uint32_t requests = _btc_requests;
+    _btc_requests = 0;
+    restore_interrupts(save);
+
+    if (requests & NWII_BTC_REQUEST_DISCONNECT)
+    {
+        printf("Disconnecting; radio off\n");
+        _btc_offline = true;
+        _btc_hid_open = false;
+        _nwii_btc_save_offline(true);
+        btstack_run_loop_remove_timer(&reconnect_timer);
+        btstack_run_loop_remove_timer(&teardown_timer);
+        /* Powering off closes the link with a normal disconnect first */
+        hci_power_control(HCI_POWER_OFF);
+    }
+
+    if (requests & NWII_BTC_REQUEST_CONNECT)
+    {
+        _nwii_btc_save_offline(false);
+        if (_btc_offline || hci_get_state() == HCI_STATE_OFF)
+        {
+            printf("Connecting; radio on\n");
+            _btc_offline = false;
+            hci_power_control(HCI_POWER_ON);
+            hci_set_bd_addr((uint8_t *)device_mac);
+        }
+        else if (!hid_cid && _nwii_btc_host_saved())
+        {
+            _nwii_btc_connect_saved_host();
+        }
+        else
+        {
+            printf("Already connected or connecting\n");
+        }
+    }
+
+    if (requests & NWII_BTC_REQUEST_CYCLE)
+    {
+        if (_btc_offline || hci_get_state() != HCI_STATE_WORKING)
+            printf("Radio is not up; use \"connect\"\n");
+        else
+            _nwii_btc_radio_cycle("Console request");
+    }
+
+    if (requests & NWII_BTC_REQUEST_FORGET)
+    {
+        _nwii_btc_forget_wii(NULL);
+        if (_btc_offline)
+        {
+            _btc_offline = false;
+            _nwii_btc_save_offline(false);
+            hci_power_control(HCI_POWER_ON);
+            hci_set_bd_addr((uint8_t *)device_mac);
+        }
+    }
+
+    if (requests & NWII_BTC_REQUEST_STATUS)
+    {
+        _nwii_btc_status();
+    }
+}
+
+void nwii_btc_request(nwii_btc_request_t request)
+{
+    static btstack_context_callback_registration_t registration = {
+        .callback = &_nwii_btc_run_requests,
+    };
+
+    const uint32_t save = save_and_disable_interrupts();
+    const bool idle = (_btc_requests == 0);
+    _btc_requests |= request;
+    restore_interrupts(save);
+
+    // One pending callback carries every request made before it runs
+    if (idle) btstack_run_loop_execute_on_main_thread(&registration);
+}
+
 void nwii_btc_enter(const uint8_t device_mac[6], bool pairing_mode)
 {
     /* Bring up the Pico W wireless stack before any BTstack objects are configured. */
@@ -560,28 +678,33 @@ void nwii_btc_enter(const uint8_t device_mac[6], bool pairing_mode)
 
     hid_device_pair_enabled = pairing_mode;
 
-    hci_power_control(HCI_POWER_ON);
-    hci_set_bd_addr((uint8_t *)device_mac);
+    /* A console "disconnect" is kept across reboots so the Pico stays off the Wii until told */
+    /* Give a console command sent right at boot (e.g. "disconnect") a moment to arrive, so a fresh
+     * flash can come up without touching the Wii */
+    for (int i = 0; i < 30; i++)
+    {
+        nwii_console_task();
+        sleep_ms(10);
+    }
 
-    /* Main loop stays tiny: flash writes happen here, outside the Bluetooth callbacks. Sending
-     * 'p' over USB serial forgets the paired Wii (same as holding GP1 at boot). */
+    _btc_offline = ((device_storage.offline == NWII_STORAGE_OFFLINE) || (_btc_requests & NWII_BTC_REQUEST_DISCONNECT)) &&
+                   !pairing_mode;
+    if (_btc_offline)
+    {
+        printf("Offline (console \"disconnect\"); send \"connect\" to go back on the Wii\n");
+    }
+    else
+    {
+        hci_power_control(HCI_POWER_ON);
+        hci_set_bd_addr((uint8_t *)device_mac);
+    }
+
+    /* Main loop stays tiny: flash writes happen here, outside the Bluetooth callbacks, and the USB
+     * serial console takes commands (send "help"). */
     for (;;)
     {
         nwii_flash_task();
-
-        const int c = getchar_timeout_us(0);
-        if (c == 's')
-        {
-            nwii_pointer_still = !nwii_pointer_still;
-            printf("Pointer %s\n", nwii_pointer_still ? "held still at center" : "circling");
-        }
-        if (c == 'p')
-        {
-            static btstack_context_callback_registration_t forget_registration = {
-                .callback = &_nwii_btc_forget_wii,
-            };
-            btstack_run_loop_execute_on_main_thread(&forget_registration);
-        }
+        nwii_console_task();
 
         sleep_ms(1);
     }

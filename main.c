@@ -37,7 +37,6 @@ static const uint NWII_EXTENSION_PIN    = 21;
 /* Example controller address used for Bluetooth bring-up. */
 const uint8_t device_mac[6] = {0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF7};
 nwii_storage_s device_storage = {0};
-volatile bool nwii_pointer_still = false;
 
 static void _nwii_input_pin_init(uint pin)
 {
@@ -145,16 +144,11 @@ void nwii_api_hook_get_input(nwii_input_s *out)
     out->remote.minus = _nwii_pressed(NWII_MINUS_BUTTON_PIN);
     out->remote.home  = _nwii_pressed(NWII_HOME_BUTTON_PIN);
 
-    /* With no sensor wired in, trace a slow circle so the Wii Menu cursor proves IR works. */
-    float x = 0.0f;
-    float y = 0.0f;
-    if (!_nwii_pressed(NWII_POINTER_HOLD_PIN) && !nwii_pointer_still)
-    {
-        const float t = (float)(time_us_64() % 6000000u) / 6000000.0f;
-        x = 0.5f * cosf(t * 6.2831853f);
-        y = 0.5f * sinf(t * 6.2831853f);
-    }
-    nwii_ir_set_pointer(out->ir, x, y);
+    /* Console overrides: held buttons, pointer, stick, accelerometer (see nwii_console.c). With
+     * no sensor wired in, the pointer traces a slow circle until told otherwise. */
+    nwii_console_apply(out);
+
+    if (_nwii_pressed(NWII_POINTER_HOLD_PIN)) nwii_ir_set_pointer(out->ir, 0.0f, 0.0f);
 }
 
 void nwii_api_hook_set_rumble(bool enable)
