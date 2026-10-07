@@ -14,10 +14,12 @@
 #include "pico/btstack_chipset_cyw43.h"
 #include "btstack.h"
 
-#if NWII_EXAMPLE_HCI_DUMP
 #include "hci_dump.h"
+#if NWII_EXAMPLE_HCI_DUMP
 #include "hci_dump_embedded_stdout.h"
 #endif
+
+#include <stdarg.h>
 
 #include "nwii_lib.h"
 
@@ -133,6 +135,68 @@ static void _nwii_btc_write_iac_task(void)
     hci_send_cmd(&hci_write_current_iac_lap_two_iacs, 2, NWII_HID_INQUIRY_ACCESS_CODE, GAP_IAC_GENERAL_INQUIRY);
     printf("Inquiry access codes: limited + general\n");
 }
+
+/*
+ * When a title starts, the Wii reloads its system software but keeps the ACL link, and its new
+ * stack addresses L2CAP channels that no longer exist. BTstack answers with a Command Reject
+ * ("invalid CID") and otherwise drops the traffic, leaving the remote unregistered until the link
+ * times out. BTstack's HCI packet-log hook is the only place that reject is visible, so watch for
+ * it there, drop the stale link and reconnect straight away, as a real remote does.
+ */
+static btstack_timer_source_t stale_link_timer;
+static hci_con_handle_t stale_link_handle = HCI_CON_HANDLE_INVALID;
+
+static void _stale_link_timer_handler(btstack_timer_source_t *ts)
+{
+    (void)ts;
+    if (stale_link_handle != HCI_CON_HANDLE_INVALID)
+    {
+        printf("Wii reloaded with stale L2CAP channels; reconnecting\n");
+        gap_disconnect(stale_link_handle);
+        stale_link_handle = HCI_CON_HANDLE_INVALID;
+    }
+}
+
+static void _stale_link_watch_log_packet(uint8_t packet_type, uint8_t in, uint8_t *packet, uint16_t len)
+{
+#if NWII_EXAMPLE_HCI_DUMP
+    hci_dump_embedded_stdout_get_instance()->log_packet(packet_type, in, packet, len);
+#endif
+
+    /* Outgoing ACL: handle(2) acl_len(2) l2cap_len(2) cid(2) code(1) id(1) len(2) reason(2) */
+    if (packet_type != HCI_ACL_DATA_PACKET || in || len < 14) return;
+    if (little_endian_read_16(packet, 6) != L2CAP_CID_SIGNALING) return;
+    if (packet[8] != 0x01 || little_endian_read_16(packet, 12) != 0x0002) return; /* Command Reject, invalid CID */
+    if (stale_link_handle != HCI_CON_HANDLE_INVALID) return;
+
+    /* Disconnect from a timer rather than from inside the HCI send path */
+    stale_link_handle = little_endian_read_16(packet, 0) & 0x0FFF;
+    btstack_run_loop_set_timer_handler(&stale_link_timer, &_stale_link_timer_handler);
+    btstack_run_loop_set_timer(&stale_link_timer, 1);
+    btstack_run_loop_add_timer(&stale_link_timer);
+}
+
+static void _stale_link_watch_reset(void)
+{
+#if NWII_EXAMPLE_HCI_DUMP
+    hci_dump_embedded_stdout_get_instance()->reset();
+#endif
+}
+
+static void _stale_link_watch_log_message(int log_level, const char *format, va_list argptr)
+{
+#if NWII_EXAMPLE_HCI_DUMP
+    hci_dump_embedded_stdout_get_instance()->log_message(log_level, format, argptr);
+#else
+    (void)log_level; (void)format; (void)argptr;
+#endif
+}
+
+static const hci_dump_t _stale_link_watch = {
+    .reset       = _stale_link_watch_reset,
+    .log_packet  = _stale_link_watch_log_packet,
+    .log_message = _stale_link_watch_log_message,
+};
 
 static void _nwii_btc_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t packet_size)
 {
@@ -318,9 +382,7 @@ void nwii_btc_enter(const uint8_t device_mac[6], bool pairing_mode)
         return;
     }
 
-#if NWII_EXAMPLE_HCI_DUMP
-    hci_dump_init(hci_dump_embedded_stdout_get_instance());
-#endif
+    hci_dump_init(&_stale_link_watch);
 
     /* GAP identity. The Wii only does legacy PIN pairing, so Secure Simple Pairing is off, and it
      * authenticates on its own terms, so we never ask for security ourselves. */
