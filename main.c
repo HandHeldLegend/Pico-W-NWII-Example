@@ -93,6 +93,7 @@ int main()
 
     nwii_device_config_s config = {
         .extension = NWII_EXTENSION_NONE,
+        .motion_plus = true, /* Report as a Wii Remote Plus; "gyro" on the console sets its rates */
     };
 
     if (nwii_api_init(&config))

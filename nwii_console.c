@@ -69,6 +69,7 @@ static volatile bool     _stick_set = false;
 static volatile uint16_t _stick_x = NWII_STICK_CENTER;
 static volatile uint16_t _stick_y = NWII_STICK_CENTER;
 static volatile bool     _accel_set = false;
+static volatile float    _gyro_dps[3] = {0.0f, 0.0f, 0.0f};
 static volatile int16_t  _accel[3] = {0, 0, NWII_ACCEL_1G_MG};
 static volatile uint64_t _shake_start_us = 0;
 static volatile uint64_t _shake_until_us = 0;
@@ -100,6 +101,7 @@ static void _nwii_console_help(void)
            "  stick <x> <y>            nunchuk stick, -1..1 (\"stick off\" recentres)\n"
            "  accel <x> <y> <z>        remote accelerometer in mg (\"accel off\" = flat)\n"
            "  shake [ms]               shake the remote (default 1000 ms)\n"
+           "  gyro <pitch> <roll> <yaw> MotionPlus rates in deg/s (\"gyro off\" = still)\n"
            "Buttons: a b 1 2 plus minus home up down left right c z\n"
            "         cc-a cc-b cc-x cc-y cc-l cc-r cc-zl cc-zr cc-plus cc-minus cc-home cc-up cc-down cc-left cc-right\n",
            NWII_CONSOLE_PRESS_MS);
@@ -296,6 +298,24 @@ static void _nwii_console_execute(char *line)
         _accel_set = true;
         printf("Accelerometer %d, %d, %d mg\n", _accel[0], _accel[1], _accel[2]);
     }
+    else if (!strcmp(cmd, "gyro"))
+    {
+        float v[3];
+        if (argc > 1 && !strcmp(argv[1], "off"))
+        {
+            for (int i = 0; i < 3; i++) _gyro_dps[i] = 0.0f;
+            printf("Gyro still\n");
+            return;
+        }
+        if (!_nwii_console_parse_float(argv[1], &v[0]) || !_nwii_console_parse_float(argv[2], &v[1]) ||
+            !_nwii_console_parse_float(argv[3], &v[2]))
+        {
+            printf("Usage: gyro <pitch> <roll> <yaw> (deg/s) | gyro off\n");
+            return;
+        }
+        for (int i = 0; i < 3; i++) _gyro_dps[i] = v[i];
+        printf("Gyro %.0f, %.0f, %.0f deg/s\n", (double)v[0], (double)v[1], (double)v[2]);
+    }
     else if (!strcmp(cmd, "shake"))
     {
         float ms = 1000.0f;
@@ -346,6 +366,10 @@ void nwii_console_apply(nwii_input_s *out)
         }
         if (_held[i]) *(bool *)((uint8_t *)out + _buttons[i].offset) = true;
     }
+
+    out->gyro_dps.pitch = _gyro_dps[0];
+    out->gyro_dps.roll = _gyro_dps[1];
+    out->gyro_dps.yaw = _gyro_dps[2];
 
     if (_stick_set)
     {
