@@ -51,6 +51,16 @@ static hci_con_handle_t wii_acl_handle = HCI_CON_HANDLE_INVALID;
 static bool _btc_reconnecting = false; /* Paging again after the Wii closed an open connection */
 static bool _btc_fresh_acl = false;    /* This attempt brought up a new link */
 
+/* Faster still: a Wii going to standby takes the page at the radio (it switches roles) and then
+ * never completes the connection, which otherwise ends only on a ~20 s timeout. While the Wii
+ * reloads for a title, a page always completes within a few seconds of the role switch. */
+static const uint32_t _btc_page_stall_ms = 5000;
+static btstack_timer_source_t page_stall_timer;
+static bool _btc_page_pending = false;  /* Reconnect page in progress */
+static bool _btc_page_answered = false; /* ...and the Wii's radio has taken it */
+
+static void _nwii_btc_wii_standby(const char *why);
+
 /* Page timeout while reconnecting (x 0.625 ms, ~5 s) so retries during a reload stay short */
 #define NWII_BTC_PAGE_TIMEOUT 0x2000
 static btstack_timer_source_t reconnect_timer;
@@ -82,9 +92,26 @@ static bool _nwii_btc_host_saved(void)
     return false;
 }
 
+static void _page_stall_timer_handler(btstack_timer_source_t *ts)
+{
+    (void)ts;
+    if (_btc_page_pending && _btc_page_answered && _btc_reconnecting)
+        _nwii_btc_wii_standby("Wii took the page but never finished connecting: going to standby");
+    _btc_page_pending = false;
+}
+
 static void _nwii_btc_connect_saved_host(void)
 {
     _btc_fresh_acl = false;
+    if (_btc_reconnecting)
+    {
+        _btc_page_pending = true;
+        _btc_page_answered = false;
+        btstack_run_loop_remove_timer(&page_stall_timer);
+        btstack_run_loop_set_timer_handler(&page_stall_timer, &_page_stall_timer_handler);
+        btstack_run_loop_set_timer(&page_stall_timer, _btc_page_stall_ms);
+        btstack_run_loop_add_timer(&page_stall_timer);
+    }
     printf("Paging saved Wii %s\n", bd_addr_to_str(device_storage.host_mac));
     uint8_t status = hid_device_connect(device_storage.host_mac, &hid_cid);
     if (status) printf("hid_device_connect error 0x%02X\n", status);
@@ -324,6 +351,8 @@ static void _nwii_btc_packet_handler(uint8_t packet_type, uint16_t channel, uint
         break;
 
     case HCI_EVENT_CONNECTION_COMPLETE:
+        _btc_page_pending = false;
+        btstack_run_loop_remove_timer(&page_stall_timer);
         hci_event_connection_complete_get_bd_addr(packet, addr);
         printf("ACL connection complete: %s status 0x%02X\n", bd_addr_to_str(addr),
                hci_event_connection_complete_get_status(packet));
@@ -335,6 +364,8 @@ static void _nwii_btc_packet_handler(uint8_t packet_type, uint16_t channel, uint
         break;
 
     case HCI_EVENT_ROLE_CHANGE:
+        if (_btc_page_pending && (hci_event_role_change_get_status(packet) == ERROR_CODE_SUCCESS))
+            _btc_page_answered = true;
         printf("Role change: status 0x%02X, now %s\n", hci_event_role_change_get_status(packet),
                hci_event_role_change_get_role(packet) ? "slave" : "master");
         break;
@@ -400,11 +431,7 @@ static void _nwii_btc_packet_handler(uint8_t packet_type, uint16_t channel, uint
                 /* The Wii took a new link but never answered: it has gone to standby */
                 if (_btc_reconnecting && _btc_fresh_acl && (status == L2CAP_CONNECTION_RESPONSE_RESULT_RTX_TIMEOUT))
                 {
-                    printf("Wii is in standby; staying off (send \"connect\" to try again)\n");
-                    _btc_reconnecting = false;
-                    _btc_offline = true; /* Not saved: the next boot connects as usual */
-                    btstack_run_loop_remove_timer(&reconnect_timer);
-                    hci_power_control(HCI_POWER_OFF);
+                    _nwii_btc_wii_standby("Wii took the link but never answered: in standby");
                     return;
                 }
 
@@ -509,6 +536,19 @@ static void _nwii_btc_packet_handler(uint8_t packet_type, uint16_t channel, uint
     default:
         break;
     }
+}
+
+/* The Wii has gone to standby: stop like a real remote. Not saved, so the next boot connects as
+ * usual. */
+static void _nwii_btc_wii_standby(const char *why)
+{
+    printf("%s; staying off (send \"connect\" to try again)\n", why);
+    _btc_reconnecting = false;
+    _btc_page_pending = false;
+    _btc_offline = true;
+    btstack_run_loop_remove_timer(&reconnect_timer);
+    btstack_run_loop_remove_timer(&page_stall_timer);
+    hci_power_control(HCI_POWER_OFF);
 }
 
 /* Runs on the BTstack thread: drop the saved Wii, its link key and any link, then wait for SYNC */
