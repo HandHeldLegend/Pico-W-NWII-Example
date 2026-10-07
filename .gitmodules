@@ -1,0 +1,3 @@
+[submodule "external/NWII-LIB-HID"]
+	path = external/NWII-LIB-HID
+	url = https://github.com/HandHeldLegend/NWII-LIB-HID

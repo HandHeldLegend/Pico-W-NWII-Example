@@ -1,7 +1,8 @@
 # Pico-W-NWII-Example
 
 Minimal Raspberry Pi Pico W firmware that pairs with a Nintendo Wii as a Wii Remote, using
-[NWII-LIB-HID](external/NWII-LIB-HID) on top of BTstack. It mirrors Pico-W-NS-Example: the library
+[NWII-LIB-HID](https://github.com/HandHeldLegend/NWII-LIB-HID) (a submodule in
+`external/NWII-LIB-HID`) on top of BTstack. It mirrors Pico-W-NS-Example: the library
 owns the Wii Remote protocol, and this project only wires up Bluetooth, pins and storage.
 
 ## Pins (active low, internal pull-ups)
@@ -17,7 +18,8 @@ owns the Wii Remote protocol, and this project only wires up Bluetooth, pins and
 
 ## Use
 
-1. Build and flash (`Pico-W-NWII-Example.uf2`).
+1. Clone with the library (`git clone --recursive`, or `git submodule update --init` in an existing
+   clone), then build and flash (`Pico-W-NWII-Example.uf2`).
 2. Open the USB serial port to watch the log. `NWII_EXAMPLE_HCI_DUMP` in CMakeLists.txt also
    prints every HCI packet.
 3. Press the red SYNC button on the Wii. The Pico answers the PIN request, the Wii opens the HID
