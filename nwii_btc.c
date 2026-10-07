@@ -29,7 +29,19 @@ static uint32_t _btc_last_hid_report_timestamp_ms = 0;
 static btstack_timer_source_t hid_timer;
 
 /* A paired remote connects to the Wii, never the reverse, so keep paging until it answers. */
-static const uint32_t _btc_reconnect_ms = 2000;
+static const uint32_t _btc_reconnect_ms = 1000;
+
+/* The Wii takes the master role, so its 20 s supervision timeout decides when a silent link
+ * dies. When a title starts or quits, the Wii stops servicing the link while it reloads; if no
+ * report has been accepted for this long, drop the link and reconnect instead of waiting. */
+static const uint32_t _btc_stall_ms = 1500;
+static btstack_timer_source_t stall_watchdog_timer;
+static uint32_t _btc_last_can_send_ms = 0;
+static bool _btc_hid_open = false; /* hid_cid is assigned before the connection finishes opening */
+static hci_con_handle_t wii_acl_handle = HCI_CON_HANDLE_INVALID;
+
+/* Page timeout while reconnecting (x 0.625 ms, ~5 s) so retries during a reload stay short */
+#define NWII_BTC_PAGE_TIMEOUT 0x2000
 static btstack_timer_source_t reconnect_timer;
 
 static bool hid_device_pair_enabled = false;
@@ -198,6 +210,20 @@ static const hci_dump_t _stale_link_watch = {
     .log_message = _stale_link_watch_log_message,
 };
 
+static void _stall_watchdog_handler(btstack_timer_source_t *ts)
+{
+    if (_btc_hid_open && wii_acl_handle != HCI_CON_HANDLE_INVALID &&
+        (btstack_run_loop_get_time_ms() - _btc_last_can_send_ms) > _btc_stall_ms)
+    {
+        printf("Link stalled (Wii reloading?); reconnecting\n");
+        gap_disconnect(wii_acl_handle);
+        _btc_last_can_send_ms = btstack_run_loop_get_time_ms();
+    }
+
+    btstack_run_loop_set_timer(ts, 250);
+    btstack_run_loop_add_timer(ts);
+}
+
 static void _nwii_btc_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t packet_size)
 {
     UNUSED(channel);
@@ -242,10 +268,14 @@ static void _nwii_btc_packet_handler(uint8_t packet_type, uint16_t channel, uint
         hci_event_connection_complete_get_bd_addr(packet, addr);
         printf("ACL connection complete: %s status 0x%02X\n", bd_addr_to_str(addr),
                hci_event_connection_complete_get_status(packet));
+        if (hci_event_connection_complete_get_status(packet) == ERROR_CODE_SUCCESS)
+            wii_acl_handle = hci_event_connection_complete_get_connection_handle(packet);
         break;
 
     case HCI_EVENT_DISCONNECTION_COMPLETE:
         printf("ACL disconnected, reason 0x%02X\n", hci_event_disconnection_complete_get_reason(packet));
+        if (hci_event_disconnection_complete_get_connection_handle(packet) == wii_acl_handle)
+            wii_acl_handle = HCI_CON_HANDLE_INVALID;
         break;
 
     case HCI_EVENT_PIN_CODE_REQUEST:
@@ -315,15 +345,23 @@ static void _nwii_btc_packet_handler(uint8_t packet_type, uint16_t channel, uint
             }
 
             nwii_api_connection_reset();
+            _btc_last_can_send_ms = btstack_run_loop_get_time_ms();
+            _btc_hid_open = true;
             hid_device_request_can_send_now_event(hid_cid);
             break;
 
         case HID_SUBEVENT_CONNECTION_CLOSED:
             printf("HID disconnected\n");
             hid_cid = 0;
+            _btc_hid_open = false;
 
-            /* Starting a title reloads the Wii's system software and drops every link; a real
-             * remote reconnects on its own, so page the Wii again. */
+            /* Quitting a title closes the HID channels but keeps the ACL link, and the Wii's
+             * restarted stack will not answer on it; drop it so the reconnect pages fresh. */
+            if (wii_acl_handle != HCI_CON_HANDLE_INVALID)
+                gap_disconnect(wii_acl_handle);
+
+            /* Starting or quitting a title reloads the Wii's system software; a real remote
+             * reconnects on its own, so page the Wii again. */
             if (_nwii_btc_host_saved())
             {
                 btstack_run_loop_set_timer_handler(&reconnect_timer, &_reconnect_timer_handler);
@@ -333,6 +371,7 @@ static void _nwii_btc_packet_handler(uint8_t packet_type, uint16_t channel, uint
             break;
 
         case HID_SUBEVENT_CAN_SEND_NOW:
+            _btc_last_can_send_ms = btstack_run_loop_get_time_ms();
             if (hid_cid)
             {
                 uint32_t current_time_ms = btstack_run_loop_get_time_ms();
@@ -393,6 +432,12 @@ void nwii_btc_enter(const uint8_t device_mac[6], bool pairing_mode)
     gap_set_local_name(nwii_hid_get_device_name());
     gap_set_default_link_policy_settings(LM_LINK_POLICY_ENABLE_ROLE_SWITCH | LM_LINK_POLICY_ENABLE_SNIFF_MODE);
     gap_set_allow_role_switch(true);
+    gap_set_link_supervision_timeout(NWII_HID_LINK_SUPERVISION_TIMEOUT);
+    gap_set_page_timeout(NWII_BTC_PAGE_TIMEOUT);
+
+    btstack_run_loop_set_timer_handler(&stall_watchdog_timer, &_stall_watchdog_handler);
+    btstack_run_loop_set_timer(&stall_watchdog_timer, 250);
+    btstack_run_loop_add_timer(&stall_watchdog_timer);
 
     hci_set_chipset(btstack_chipset_cyw43_instance());
 
