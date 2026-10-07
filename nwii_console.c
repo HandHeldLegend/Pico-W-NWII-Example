@@ -70,6 +70,7 @@ static volatile uint16_t _stick_x = NWII_STICK_CENTER;
 static volatile uint16_t _stick_y = NWII_STICK_CENTER;
 static volatile bool     _accel_set = false;
 static volatile int16_t  _accel[3] = {0, 0, NWII_ACCEL_1G_MG};
+static volatile uint64_t _shake_start_us = 0;
 static volatile uint64_t _shake_until_us = 0;
 
 static char    _line[NWII_CONSOLE_LINE_MAX];
@@ -299,7 +300,10 @@ static void _nwii_console_execute(char *line)
     {
         float ms = 1000.0f;
         if (argc > 1) _nwii_console_parse_float(argv[1], &ms);
-        _shake_until_us = time_us_64() + (uint64_t)(ms * 1000.0f);
+        // Whole swings only, so the shake ends at rest
+        const uint64_t swings = (uint64_t)(ms / 166.0f) + 1u;
+        _shake_start_us = time_us_64();
+        _shake_until_us = _shake_start_us + swings * 166000u;
         printf("Shaking for %d ms\n", (int)ms);
     }
     else
@@ -358,8 +362,9 @@ void nwii_console_apply(nwii_input_s *out)
 
     if (now < _shake_until_us)
     {
-        // Square wave well past the shake threshold, as the HOJA core does
-        const int16_t delta = ((now / 50000u) & 1u) ? 3000 : -3000;
+        // ~6 Hz swing of +/-3 g from the command, as the HOJA core does
+        const float phase = (float)((now - _shake_start_us) % 166000u) / 166000.0f;
+        const int16_t delta = (int16_t)(3000.0f * sinf(phase * 6.2831853f));
         out->accel_x += delta;
         out->accel_y += delta;
         out->accel_z += delta;
