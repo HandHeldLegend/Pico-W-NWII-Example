@@ -32,6 +32,13 @@ static btstack_timer_source_t hid_timer;
 /* A paired remote connects to the Wii, never the reverse, so keep paging until it answers. */
 static const uint32_t _btc_reconnect_ms = 1000;
 
+/* Quitting or launching a title can leave the Wii holding the link without taking our reports,
+ * with nothing on the link to say so. If no report has gone out for this long, power-cycle the
+ * radio and reconnect. With several remotes connected the Wii can take a second or two to service
+ * a link, so this stays well above that. */
+static const uint32_t _btc_stall_ms = 6000;
+static btstack_timer_source_t stall_watchdog_timer;
+static uint32_t _btc_last_can_send_ms = 0;
 static bool _btc_hid_open = false; /* hid_cid is assigned before the connection finishes opening */
 static hci_con_handle_t wii_acl_handle = HCI_CON_HANDLE_INVALID;
 
@@ -234,6 +241,18 @@ static void _teardown_timer_handler(btstack_timer_source_t *ts)
     teardown_handle = HCI_CON_HANDLE_INVALID;
 }
 
+static void _stall_watchdog_handler(btstack_timer_source_t *ts)
+{
+    if (_btc_hid_open && wii_acl_handle != HCI_CON_HANDLE_INVALID &&
+        (btstack_run_loop_get_time_ms() - _btc_last_can_send_ms) > _btc_stall_ms)
+    {
+        _nwii_btc_radio_cycle("Link stalled (no report sent for 6 s)");
+    }
+
+    btstack_run_loop_set_timer(ts, 500);
+    btstack_run_loop_add_timer(ts);
+}
+
 static void _nwii_btc_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t packet_size)
 {
     UNUSED(channel);
@@ -380,6 +399,7 @@ static void _nwii_btc_packet_handler(uint8_t packet_type, uint16_t channel, uint
             }
 
             nwii_api_connection_reset();
+            _btc_last_can_send_ms = btstack_run_loop_get_time_ms();
             _btc_hid_open = true;
             hid_device_request_can_send_now_event(hid_cid);
             break;
@@ -415,6 +435,7 @@ static void _nwii_btc_packet_handler(uint8_t packet_type, uint16_t channel, uint
             break;
 
         case HID_SUBEVENT_CAN_SEND_NOW:
+            _btc_last_can_send_ms = btstack_run_loop_get_time_ms();
             if (hid_cid)
             {
                 uint32_t current_time_ms = btstack_run_loop_get_time_ms();
@@ -502,8 +523,9 @@ void nwii_btc_enter(const uint8_t device_mac[6], bool pairing_mode)
     gap_set_link_supervision_timeout(NWII_HID_LINK_SUPERVISION_TIMEOUT);
     gap_set_page_timeout(NWII_BTC_PAGE_TIMEOUT);
 
-    /* No report-stall watchdog: with several remotes connected the Wii can legitimately take
-     * seconds to service a link (sniff mode), and a watchdog then loops on reconnects. */
+    btstack_run_loop_set_timer_handler(&stall_watchdog_timer, &_stall_watchdog_handler);
+    btstack_run_loop_set_timer(&stall_watchdog_timer, 500);
+    btstack_run_loop_add_timer(&stall_watchdog_timer);
 
     hci_set_chipset(btstack_chipset_cyw43_instance());
 
