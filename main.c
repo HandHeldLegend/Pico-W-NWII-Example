@@ -31,7 +31,7 @@ static const uint NWII_PLUS_BUTTON_PIN  = 18;
 static const uint NWII_MINUS_BUTTON_PIN = 19;
 static const uint NWII_HOME_BUTTON_PIN  = 20;
 
-/* Tap GP21 low to cycle the extension: none -> Nunchuk -> Classic Controller Pro. */
+/* Tap GP21 low to cycle the extension: none -> Nunchuk -> Classic -> Classic Controller Pro. */
 static const uint NWII_EXTENSION_PIN    = 21;
 
 /* Example controller address used for Bluetooth bring-up. */
@@ -119,7 +119,6 @@ static void _nwii_extension_button_task(void)
     if (pressed && !was_pressed)
     {
         nwii_extension_t next = (nwii_extension_t)(nwii_api_get_extension() + 1);
-        if (next == NWII_EXTENSION_CLASSIC) next = NWII_EXTENSION_CLASSIC_PRO;
         if (next >= NWII_EXTENSION_MAX) next = NWII_EXTENSION_NONE;
 
         printf("Extension -> %d\n", (int)next);

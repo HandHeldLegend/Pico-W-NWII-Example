@@ -56,9 +56,13 @@ typedef enum
     NWII_BTC_REQUEST_CYCLE      = 1u << 2, // Power-cycle the radio and reconnect
     NWII_BTC_REQUEST_FORGET     = 1u << 3, // Forget the Wii and wait for SYNC
     NWII_BTC_REQUEST_STATUS     = 1u << 4, // Print the connection state
+    NWII_BTC_REQUEST_INJECT     = 1u << 5, // Feed the report from nwii_btc_inject() to the library
 } nwii_btc_request_t;
 
 void nwii_btc_request(nwii_btc_request_t request);
+
+/* Test aid: process an output report as if the Wii had sent it (runs on the BTstack thread). */
+void nwii_btc_inject(const uint8_t *report, uint8_t len);
 
 /* USB serial console (see nwii_console.c; send "help"). */
 void nwii_console_task(void);

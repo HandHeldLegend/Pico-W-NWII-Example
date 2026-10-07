@@ -70,6 +70,7 @@ static volatile uint16_t _stick_x = NWII_STICK_CENTER;
 static volatile uint16_t _stick_y = NWII_STICK_CENTER;
 static volatile bool     _accel_set = false;
 static volatile float    _gyro_dps[3] = {0.0f, 0.0f, 0.0f};
+static volatile uint16_t _trigger[2] = {0, 0}; // Classic analog L/R, 0..4095
 static volatile int16_t  _accel[3] = {0, 0, NWII_ACCEL_1G_MG};
 static volatile uint64_t _shake_start_us = 0;
 static volatile uint64_t _shake_until_us = 0;
@@ -95,13 +96,17 @@ static void _nwii_console_help(void)
            "  status                   connection, extension and input state\n"
            "  press <btn> [ms]         tap a button (default %d ms)\n"
            "  hold <btn> | release <btn|all>\n"
-           "  ext none|nunchuk|classic attach or detach an extension\n"
+           "  ext none|nunchuk|classic|classicpro  attach or detach an extension\n"
+           "                           (classic has analog L/R; the Pro's are digital)\n"
+           "  trig <l> <r>             Classic analog triggers, 0..1 (\"trig off\" = released)\n"
            "  point <x> <y> [roll_deg] hold the pointer (-1..1, +x right, +y up)\n"
            "  circle | still | hide    demo circle | centre | pointed away\n"
            "  stick <x> <y>            nunchuk stick, -1..1 (\"stick off\" recentres)\n"
            "  accel <x> <y> <z>        remote accelerometer in mg (\"accel off\" = flat)\n"
            "  shake [ms]               shake the remote (default 1000 ms)\n"
            "  gyro <pitch> <roll> <yaw> MotionPlus rates in deg/s (\"gyro off\" = still)\n"
+           "  host <hex bytes...>      process an output report as if the Wii sent it\n"
+           "  mp <mode>                activate the MotionPlus like the Wii Menu (4, 5 or 7)\n"
            "Buttons: a b 1 2 plus minus home up down left right c z\n"
            "         cc-a cc-b cc-x cc-y cc-l cc-r cc-zl cc-zr cc-plus cc-minus cc-home cc-up cc-down cc-left cc-right\n",
            NWII_CONSOLE_PRESS_MS);
@@ -145,9 +150,9 @@ static uint16_t _nwii_console_stick(float v)
 
 static void _nwii_console_execute(char *line)
 {
-    char *argv[5] = {0};
+    char *argv[24] = {0};
     int argc = 0;
-    for (char *tok = strtok(line, " \t"); tok && argc < 5; tok = strtok(NULL, " \t"))
+    for (char *tok = strtok(line, " \t"); tok && argc < 24; tok = strtok(NULL, " \t"))
     {
         for (char *p = tok; *p; p++) *p = (char)tolower((unsigned char)*p);
         argv[argc++] = tok;
@@ -219,10 +224,11 @@ static void _nwii_console_execute(char *line)
     else if (!strcmp(cmd, "ext"))
     {
         nwii_extension_t ext;
-        if (argc < 2) { printf("Usage: ext none|nunchuk|classic\n"); return; }
+        if (argc < 2) { printf("Usage: ext none|nunchuk|classic|classicpro\n"); return; }
         if (!strcmp(argv[1], "none")) ext = NWII_EXTENSION_NONE;
         else if (!strcmp(argv[1], "nunchuk")) ext = NWII_EXTENSION_NUNCHUK;
-        else if (!strcmp(argv[1], "classic")) ext = NWII_EXTENSION_CLASSIC_PRO;
+        else if (!strcmp(argv[1], "classic")) ext = NWII_EXTENSION_CLASSIC;
+        else if (!strcmp(argv[1], "classicpro")) ext = NWII_EXTENSION_CLASSIC_PRO;
         else { printf("Unknown extension '%s'\n", argv[1]); return; }
         nwii_api_set_extension(ext);
         printf("Extension -> %s\n", argv[1]);
@@ -316,6 +322,51 @@ static void _nwii_console_execute(char *line)
         for (int i = 0; i < 3; i++) _gyro_dps[i] = v[i];
         printf("Gyro %.0f, %.0f, %.0f deg/s\n", (double)v[0], (double)v[1], (double)v[2]);
     }
+    else if (!strcmp(cmd, "trig"))
+    {
+        float l, r;
+        if (argc > 1 && !strcmp(argv[1], "off"))
+        {
+            _trigger[0] = 0;
+            _trigger[1] = 0;
+            printf("Triggers released\n");
+            return;
+        }
+        if (!_nwii_console_parse_float(argv[1], &l) || !_nwii_console_parse_float(argv[2], &r))
+        {
+            printf("Usage: trig <l> <r> (0..1) | trig off\n");
+            return;
+        }
+        if (l < 0.0f) l = 0.0f;
+        if (l > 1.0f) l = 1.0f;
+        if (r < 0.0f) r = 0.0f;
+        if (r > 1.0f) r = 1.0f;
+        _trigger[0] = (uint16_t)(l * 4095.0f);
+        _trigger[1] = (uint16_t)(r * 4095.0f);
+        printf("Triggers L %.2f, R %.2f\n", (double)l, (double)r);
+    }
+    else if (!strcmp(cmd, "host") || !strcmp(cmd, "mp"))
+    {
+        uint8_t report[NWII_OUTPUT_REPORT_MAX] = {0};
+        uint8_t len = 0;
+
+        if (!strcmp(cmd, "mp"))
+        {
+            // Register write, 1 byte at 0xA600FE (selects the pass-through mode and activates)
+            const uint8_t mode = (argc > 1) ? (uint8_t)strtoul(argv[1], NULL, 16) : 0x05u;
+            const uint8_t write[] = {0x16, 0x04, 0xA6, 0x00, 0xFE, 0x01, mode};
+            memcpy(report, write, sizeof(write));
+            len = 22;
+        }
+        else
+        {
+            for (int i = 1; i < argc && len < sizeof(report); i++)
+                report[len++] = (uint8_t)strtoul(argv[i], NULL, 16);
+        }
+
+        if (!len) { printf("Usage: host <hex bytes...> | mp <mode>\n"); return; }
+        nwii_btc_inject(report, len);
+    }
     else if (!strcmp(cmd, "shake"))
     {
         float ms = 1000.0f;
@@ -366,6 +417,9 @@ void nwii_console_apply(nwii_input_s *out)
         }
         if (_held[i]) *(bool *)((uint8_t *)out + _buttons[i].offset) = true;
     }
+
+    out->classic.lt = _trigger[0];
+    out->classic.rt = _trigger[1];
 
     out->gyro_dps.pitch = _gyro_dps[0];
     out->gyro_dps.roll = _gyro_dps[1];

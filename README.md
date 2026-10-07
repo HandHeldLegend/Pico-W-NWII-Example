@@ -14,7 +14,7 @@ owns the Wii Remote protocol, and this project only wires up Bluetooth, pins and
 | GP14 / GP15 | A / B |
 | GP16 / GP17 | 1 / 2 |
 | GP18 / GP19 / GP20 | + / - / Home |
-| GP21 | Tap: cycle extension (none → Nunchuk → Classic Controller Pro) |
+| GP21 | Tap: cycle extension (none → Nunchuk → Classic → Classic Controller Pro) |
 
 ## Use
 
@@ -37,7 +37,10 @@ Send commands over the USB serial port, one per line (`help` lists them all):
 | `forget` | Forget the paired Wii and wait for SYNC |
 | `status` | Connection, extension and held buttons |
 | `press <btn> [ms]`, `hold <btn>`, `release <btn\|all>` | Buttons: `a b 1 2 plus minus home up down left right c z`, and `cc-*` for the Classic Controller |
-| `ext none\|nunchuk\|classic` | Attach or detach an extension |
+| `ext none\|nunchuk\|classic\|classicpro` | Attach or detach an extension (the original Classic has analog L/R; the Pro's are digital) |
+| `trig <l> <r>` | Classic analog triggers, 0..1 |
+| `gyro <pitch> <roll> <yaw>` | MotionPlus rates in deg/s |
+| `host <hex bytes...>`, `mp <mode>` | Test aids: process a report as if the Wii sent it; activate the MotionPlus like the Wii Menu |
 | `point <x> <y> [roll_deg]`, `circle`, `still`, `hide` | Pointer: held position, demo circle, centre, pointed away |
 | `stick <x> <y>`, `accel <x> <y> <z>`, `shake [ms]` | Nunchuk stick (-1..1), remote accelerometer (mg), shake |
 

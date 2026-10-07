@@ -511,8 +511,18 @@ static void _nwii_btc_packet_handler(uint8_t packet_type, uint16_t channel, uint
 
                     if (nwii_api_generate_inputreport(report, &len))
                     {
-                        // Log replies (status / read data / ack); data reports are too frequent
-                        if (report[0] < 0x30) _nwii_btc_print_hex("IN ", report, len);
+                        // Log replies, plus the first data report of each mode (hosts such as
+                        // Nintendont calibrate on it)
+                        static uint8_t last_data_mode = 0;
+                        if (report[0] < 0x30)
+                        {
+                            _nwii_btc_print_hex("IN ", report, len);
+                        }
+                        else if (report[0] != last_data_mode)
+                        {
+                            last_data_mode = report[0];
+                            _nwii_btc_print_hex("IN*", report, len);
+                        }
                         _nwii_btc_hid_tunnel(report, len);
                     }
 
@@ -597,6 +607,8 @@ static void _nwii_btc_status(void)
 }
 
 static volatile uint32_t _btc_requests = 0;
+static uint8_t _btc_inject_report[NWII_OUTPUT_REPORT_MAX];
+static uint8_t _btc_inject_len = 0;
 
 /* Runs on the BTstack thread */
 static void _nwii_btc_run_requests(void *context)
@@ -664,6 +676,21 @@ static void _nwii_btc_run_requests(void *context)
     {
         _nwii_btc_status();
     }
+
+    if ((requests & NWII_BTC_REQUEST_INJECT) && _btc_inject_len)
+    {
+        _nwii_btc_print_hex("INJ", _btc_inject_report, _btc_inject_len);
+        nwii_api_output_tunnel(_btc_inject_report, _btc_inject_len);
+        _btc_inject_len = 0;
+    }
+}
+
+void nwii_btc_inject(const uint8_t *report, uint8_t len)
+{
+    if (len > sizeof(_btc_inject_report)) len = sizeof(_btc_inject_report);
+    memcpy(_btc_inject_report, report, len);
+    _btc_inject_len = len;
+    nwii_btc_request(NWII_BTC_REQUEST_INJECT);
 }
 
 void nwii_btc_request(nwii_btc_request_t request)
