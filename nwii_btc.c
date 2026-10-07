@@ -32,12 +32,6 @@ static btstack_timer_source_t hid_timer;
 /* A paired remote connects to the Wii, never the reverse, so keep paging until it answers. */
 static const uint32_t _btc_reconnect_ms = 1000;
 
-/* The Wii takes the master role, so its 20 s supervision timeout decides when a silent link
- * dies. When a title starts or quits, the Wii stops servicing the link while it reloads; if no
- * report has been accepted for this long, drop the link and reconnect instead of waiting. */
-static const uint32_t _btc_stall_ms = 1500;
-static btstack_timer_source_t stall_watchdog_timer;
-static uint32_t _btc_last_can_send_ms = 0;
 static bool _btc_hid_open = false; /* hid_cid is assigned before the connection finishes opening */
 static hci_con_handle_t wii_acl_handle = HCI_CON_HANDLE_INVALID;
 
@@ -240,18 +234,6 @@ static void _teardown_timer_handler(btstack_timer_source_t *ts)
     teardown_handle = HCI_CON_HANDLE_INVALID;
 }
 
-static void _stall_watchdog_handler(btstack_timer_source_t *ts)
-{
-    if (_btc_hid_open && wii_acl_handle != HCI_CON_HANDLE_INVALID &&
-        (btstack_run_loop_get_time_ms() - _btc_last_can_send_ms) > _btc_stall_ms)
-    {
-        _nwii_btc_radio_cycle("Link stalled (Wii reloading?)");
-    }
-
-    btstack_run_loop_set_timer(ts, 250);
-    btstack_run_loop_add_timer(ts);
-}
-
 static void _nwii_btc_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t packet_size)
 {
     UNUSED(channel);
@@ -398,7 +380,6 @@ static void _nwii_btc_packet_handler(uint8_t packet_type, uint16_t channel, uint
             }
 
             nwii_api_connection_reset();
-            _btc_last_can_send_ms = btstack_run_loop_get_time_ms();
             _btc_hid_open = true;
             hid_device_request_can_send_now_event(hid_cid);
             break;
@@ -434,7 +415,6 @@ static void _nwii_btc_packet_handler(uint8_t packet_type, uint16_t channel, uint
             break;
 
         case HID_SUBEVENT_CAN_SEND_NOW:
-            _btc_last_can_send_ms = btstack_run_loop_get_time_ms();
             if (hid_cid)
             {
                 uint32_t current_time_ms = btstack_run_loop_get_time_ms();
@@ -515,16 +495,15 @@ void nwii_btc_enter(const uint8_t device_mac[6], bool pairing_mode)
     gap_set_bondable_mode(1);
     gap_set_class_of_device(NWII_HID_CLASS_OF_DEVICE);
     gap_set_local_name(nwii_hid_get_device_name());
-    /* Keep the master role on links we open, so our 2 s supervision timeout (not the Wii's 20 s)
-     * decides how quickly a dead link ends on both sides. */
-    gap_set_default_link_policy_settings(LM_LINK_POLICY_ENABLE_SNIFF_MODE);
-    gap_set_allow_role_switch(false);
+    /* Let the Wii take the master role, as real remotes do: with other remotes connected, or once
+     * a game is running, the Wii hangs up on a remote that refuses the role switch. */
+    gap_set_default_link_policy_settings(LM_LINK_POLICY_ENABLE_ROLE_SWITCH | LM_LINK_POLICY_ENABLE_SNIFF_MODE);
+    gap_set_allow_role_switch(true);
     gap_set_link_supervision_timeout(NWII_HID_LINK_SUPERVISION_TIMEOUT);
     gap_set_page_timeout(NWII_BTC_PAGE_TIMEOUT);
 
-    btstack_run_loop_set_timer_handler(&stall_watchdog_timer, &_stall_watchdog_handler);
-    btstack_run_loop_set_timer(&stall_watchdog_timer, 250);
-    btstack_run_loop_add_timer(&stall_watchdog_timer);
+    /* No report-stall watchdog: with several remotes connected the Wii can legitimately take
+     * seconds to service a link (sniff mode), and a watchdog then loops on reconnects. */
 
     hci_set_chipset(btstack_chipset_cyw43_instance());
 
@@ -568,7 +547,13 @@ void nwii_btc_enter(const uint8_t device_mac[6], bool pairing_mode)
     {
         nwii_flash_task();
 
-        if (getchar_timeout_us(0) == 'p')
+        const int c = getchar_timeout_us(0);
+        if (c == 's')
+        {
+            nwii_pointer_still = !nwii_pointer_still;
+            printf("Pointer %s\n", nwii_pointer_still ? "held still at center" : "circling");
+        }
+        if (c == 'p')
         {
             static btstack_context_callback_registration_t forget_registration = {
                 .callback = &_nwii_btc_forget_wii,

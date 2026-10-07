@@ -39,6 +39,9 @@ bool nwii_flash_read(uint8_t *out, uint32_t size, uint32_t page);
 void nwii_flash_task();
 void nwii_flash_init();
 
+/* Serial 's' toggles this: hold the pointer still, like an untouched remote. */
+extern volatile bool nwii_pointer_still;
+
 /* Bluetooth transport entry point. */
 void nwii_btc_enter(const uint8_t device_mac[6], bool pairing_mode);
 
