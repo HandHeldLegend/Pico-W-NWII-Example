@@ -10,6 +10,7 @@
 
 #include "main.h"
 
+#include "pico/stdlib.h"
 #include "pico/cyw43_arch.h"
 #include "pico/btstack_chipset_cyw43.h"
 #include "btstack.h"
@@ -210,14 +211,41 @@ static const hci_dump_t _stale_link_watch = {
     .log_message = _stale_link_watch_log_message,
 };
 
+/* A reloading Wii keeps transmitting but stops acknowledging us, so a normal disconnect waits out
+ * the 30 s LMP response timeout. Power-cycling our radio drops the link locally in about a second
+ * (BTstack's halting watchdog discards connections the controller cannot close). Because we keep
+ * the master role, our 2 s supervision timeout also ends the link on the Wii's side quickly. */
+static bool _btc_radio_cycling = false;
+
+static void _nwii_btc_radio_cycle(const char *why)
+{
+    if (_btc_radio_cycling) return;
+    printf("%s; power-cycling the radio to drop the link\n", why);
+    _btc_radio_cycling = true;
+    _btc_hid_open = false;
+    hci_power_control(HCI_POWER_OFF);
+}
+
+/* After the Wii closes the HID channels, give a normal disconnect this long before cycling */
+static const uint32_t _btc_teardown_ms = 1500;
+static btstack_timer_source_t teardown_timer;
+static hci_con_handle_t teardown_handle = HCI_CON_HANDLE_INVALID;
+
+static void _teardown_timer_handler(btstack_timer_source_t *ts)
+{
+    (void)ts;
+    /* Only if that same link is still up; a fresh reconnect may already have replaced it */
+    if (teardown_handle != HCI_CON_HANDLE_INVALID && teardown_handle == wii_acl_handle)
+        _nwii_btc_radio_cycle("Disconnect did not complete");
+    teardown_handle = HCI_CON_HANDLE_INVALID;
+}
+
 static void _stall_watchdog_handler(btstack_timer_source_t *ts)
 {
     if (_btc_hid_open && wii_acl_handle != HCI_CON_HANDLE_INVALID &&
         (btstack_run_loop_get_time_ms() - _btc_last_can_send_ms) > _btc_stall_ms)
     {
-        printf("Link stalled (Wii reloading?); reconnecting\n");
-        gap_disconnect(wii_acl_handle);
-        _btc_last_can_send_ms = btstack_run_loop_get_time_ms();
+        _nwii_btc_radio_cycle("Link stalled (Wii reloading?)");
     }
 
     btstack_run_loop_set_timer(ts, 250);
@@ -236,8 +264,20 @@ static void _nwii_btc_packet_handler(uint8_t packet_type, uint16_t channel, uint
     switch (packet[0])
     {
     case BTSTACK_EVENT_STATE:
+        if (btstack_event_state_get_state(packet) == HCI_STATE_OFF && _btc_radio_cycling)
+        {
+            wii_acl_handle = HCI_CON_HANDLE_INVALID;
+            hid_cid = 0;
+            _btc_iac_pending = true; // the controller forgets the IACs on reset
+            hci_power_control(HCI_POWER_ON);
+            /* The custom address is only applied on the first power-on; without this the radio
+             * comes back with its factory address and the Wii refuses the unknown remote. */
+            hci_set_bd_addr((uint8_t *)device_mac);
+            return;
+        }
         if (btstack_event_state_get_state(packet) != HCI_STATE_WORKING) return;
 
+        _btc_radio_cycling = false;
         printf("BTstack up, local address %s\n", bd_addr_to_str(device_mac));
         _nwii_btc_write_iac_task();
 
@@ -272,10 +312,20 @@ static void _nwii_btc_packet_handler(uint8_t packet_type, uint16_t channel, uint
             wii_acl_handle = hci_event_connection_complete_get_connection_handle(packet);
         break;
 
+    case HCI_EVENT_ROLE_CHANGE:
+        printf("Role change: status 0x%02X, now %s\n", hci_event_role_change_get_status(packet),
+               hci_event_role_change_get_role(packet) ? "slave" : "master");
+        break;
+
     case HCI_EVENT_DISCONNECTION_COMPLETE:
         printf("ACL disconnected, reason 0x%02X\n", hci_event_disconnection_complete_get_reason(packet));
         if (hci_event_disconnection_complete_get_connection_handle(packet) == wii_acl_handle)
             wii_acl_handle = HCI_CON_HANDLE_INVALID;
+        if (hci_event_disconnection_complete_get_connection_handle(packet) == teardown_handle)
+        {
+            btstack_run_loop_remove_timer(&teardown_timer);
+            teardown_handle = HCI_CON_HANDLE_INVALID;
+        }
         break;
 
     case HCI_EVENT_PIN_CODE_REQUEST:
@@ -337,6 +387,9 @@ static void _nwii_btc_packet_handler(uint8_t packet_type, uint16_t channel, uint
             hid_cid = hid_subevent_connection_opened_get_hid_cid(packet);
             printf("HID connected to %s\n", bd_addr_to_str(addr));
 
+            /* Paired (or reconnected): from now on a dropped link pages this Wii again */
+            hid_device_pair_enabled = false;
+
             if (memcmp(device_storage.host_mac, addr, 6) != 0)
             {
                 memcpy(device_storage.host_mac, addr, 6);
@@ -355,10 +408,20 @@ static void _nwii_btc_packet_handler(uint8_t packet_type, uint16_t channel, uint
             hid_cid = 0;
             _btc_hid_open = false;
 
+            /* Torn down by our own radio cycle: the reconnect happens once BTstack is back up */
+            if (_btc_radio_cycling) break;
+
             /* Quitting a title closes the HID channels but keeps the ACL link, and the Wii's
              * restarted stack will not answer on it; drop it so the reconnect pages fresh. */
             if (wii_acl_handle != HCI_CON_HANDLE_INVALID)
+            {
                 gap_disconnect(wii_acl_handle);
+                teardown_handle = wii_acl_handle;
+                btstack_run_loop_remove_timer(&teardown_timer);
+                btstack_run_loop_set_timer_handler(&teardown_timer, &_teardown_timer_handler);
+                btstack_run_loop_set_timer(&teardown_timer, _btc_teardown_ms);
+                btstack_run_loop_add_timer(&teardown_timer);
+            }
 
             /* Starting or quitting a title reloads the Wii's system software; a real remote
              * reconnects on its own, so page the Wii again. */
@@ -412,6 +475,28 @@ static void _nwii_btc_packet_handler(uint8_t packet_type, uint16_t channel, uint
     }
 }
 
+/* Runs on the BTstack thread: drop the saved Wii, its link key and any link, then wait for SYNC */
+static void _nwii_btc_forget_wii(void *context)
+{
+    (void)context;
+    printf("Forgetting the paired Wii; press SYNC on the Wii\n");
+
+    hid_device_pair_enabled = true;
+    btstack_run_loop_remove_timer(&reconnect_timer);
+    btstack_run_loop_remove_timer(&teardown_timer);
+
+    if (_nwii_btc_host_saved())
+        gap_drop_link_key_for_bd_addr(device_storage.host_mac);
+
+    memset(device_storage.host_mac, 0, sizeof(device_storage.host_mac));
+    nwii_flash_write((uint8_t *)&device_storage, NWII_STORAGE_SIZE, NWII_STORAGE_PAGE);
+
+    if (wii_acl_handle != HCI_CON_HANDLE_INVALID)
+        gap_disconnect(wii_acl_handle);
+
+    gap_discoverable_control(1);
+}
+
 void nwii_btc_enter(const uint8_t device_mac[6], bool pairing_mode)
 {
     /* Bring up the Pico W wireless stack before any BTstack objects are configured. */
@@ -430,8 +515,10 @@ void nwii_btc_enter(const uint8_t device_mac[6], bool pairing_mode)
     gap_set_bondable_mode(1);
     gap_set_class_of_device(NWII_HID_CLASS_OF_DEVICE);
     gap_set_local_name(nwii_hid_get_device_name());
-    gap_set_default_link_policy_settings(LM_LINK_POLICY_ENABLE_ROLE_SWITCH | LM_LINK_POLICY_ENABLE_SNIFF_MODE);
-    gap_set_allow_role_switch(true);
+    /* Keep the master role on links we open, so our 2 s supervision timeout (not the Wii's 20 s)
+     * decides how quickly a dead link ends on both sides. */
+    gap_set_default_link_policy_settings(LM_LINK_POLICY_ENABLE_SNIFF_MODE);
+    gap_set_allow_role_switch(false);
     gap_set_link_supervision_timeout(NWII_HID_LINK_SUPERVISION_TIMEOUT);
     gap_set_page_timeout(NWII_BTC_PAGE_TIMEOUT);
 
@@ -475,10 +562,20 @@ void nwii_btc_enter(const uint8_t device_mac[6], bool pairing_mode)
     hci_power_control(HCI_POWER_ON);
     hci_set_bd_addr((uint8_t *)device_mac);
 
-    /* Main loop stays tiny: flash writes happen here, outside the Bluetooth callbacks. */
+    /* Main loop stays tiny: flash writes happen here, outside the Bluetooth callbacks. Sending
+     * 'p' over USB serial forgets the paired Wii (same as holding GP1 at boot). */
     for (;;)
     {
         nwii_flash_task();
+
+        if (getchar_timeout_us(0) == 'p')
+        {
+            static btstack_context_callback_registration_t forget_registration = {
+                .callback = &_nwii_btc_forget_wii,
+            };
+            btstack_run_loop_execute_on_main_thread(&forget_registration);
+        }
+
         sleep_ms(1);
     }
 }
