@@ -53,8 +53,9 @@ static bool _btc_fresh_acl = false;    /* This attempt brought up a new link */
 
 /* Faster still: a Wii going to standby takes the page at the radio (it switches roles) and then
  * never completes the connection, which otherwise ends only on a ~20 s timeout. While the Wii
- * reloads for a title, a page always completes within a few seconds of the role switch. */
-static const uint32_t _btc_page_stall_ms = 5000;
+ * reloads for a title, a page has completed within ~3.5 s of the role switch; leaving the Homebrew
+ * Channel can take longer, so allow 10 s. */
+static const uint32_t _btc_page_stall_ms = 10000;
 static btstack_timer_source_t page_stall_timer;
 static bool _btc_page_pending = false;  /* Reconnect page in progress */
 static bool _btc_page_answered = false; /* ...and the Wii's radio has taken it */
